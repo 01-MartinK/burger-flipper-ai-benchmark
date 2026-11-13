@@ -257,5 +257,6 @@ fn shake_camera(
         (t * 29.0 + 2.1).sin(),
     ) * strength;
     transform.translation = rig.base.translation + offset;
+    transform.rotation = rig.base.rotation;
     shake.trauma = (shake.trauma - time.delta_secs() * 1.5).max(0.0);
 }

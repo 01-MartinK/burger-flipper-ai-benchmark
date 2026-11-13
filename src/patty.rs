@@ -1,4 +1,5 @@
-//! Patties: dropping them on the grill, cooking, flipping, serving and binning.
+//! Food on the grill, patties and bacon alike: dropping it on, cooking,
+//! flipping, sending it to the prep table and binning it.
 
 use std::f32::consts::PI;
 
@@ -11,16 +12,17 @@ use crate::audio::{PlaySfx, Sfx};
 use crate::effects::{Burst, ParticleKind};
 use crate::game::{Feedback, GameRng, Shift, running};
 use crate::hud::{GREEN, ORANGE, Popup, RED, YELLOW};
+use crate::ingredients::Pantry;
 use crate::kitchen::{
-    BIN_MOUTH, GrillCursor, ORDER_PASS, RingMaterials, SLOTS, SlotRing, WARMER_SPOTS,
+    BIN_MOUTH, GrillCursor, LoadMarker, PASS_TRAY, RAW_TRAY_SIZE, RAW_TRAYS, RingMaterials, SLOTS,
+    SlotRing,
 };
-use crate::orders::{self, Claim, Order, Warmer};
-use crate::rules::{self, Doneness, Quality, Verdict};
+use crate::rules::{self, Doneness, Protein, Quality, Verdict};
+use crate::stations::{Alerts, Cursor, Station, View, ray_hits_box};
 
 pub const PATTY_RADIUS: f32 = 0.85;
-const THICKNESS: f32 = 0.34;
-/// Height of a patty's centre when it lies on the grate.
-const REST_HEIGHT: f32 = THICKNESS / 2.0 + 0.01;
+const BACON_LENGTH: f32 = 1.6;
+const BACON_WIDTH: f32 = 0.46;
 const DROP_HEIGHT: f32 = 3.0;
 const DROP_TIME: f32 = 0.3;
 const FLIP_TIME: f32 = 0.5;
@@ -34,12 +36,13 @@ const MARK_OFFSETS: [f32; 4] = [-0.48, -0.16, 0.16, 0.48];
 
 pub fn plugin(app: &mut App) {
     app.init_resource::<Grill>()
+        .init_resource::<GrillLoad>()
         .add_systems(Startup, load_patty_assets)
         .add_systems(OnEnter(GameState::Playing), clear_grill)
         .add_systems(
             Update,
             (
-                (handle_clicks, cook, highlight_slots)
+                (handle_clicks, cook, highlight_slots, call_for_attention)
                     .chain()
                     .run_if(in_state(GameState::Playing)),
                 // Patties already in the air finish their moves behind the game-over screen.
@@ -52,6 +55,10 @@ pub fn plugin(app: &mut App) {
         );
 }
 
+/// What a click on an empty grill slot drops there.
+#[derive(Resource, Default)]
+pub struct GrillLoad(pub Protein);
+
 /// Which patty occupies each grill slot.
 #[derive(Resource, Default)]
 pub struct Grill {
@@ -60,6 +67,7 @@ pub struct Grill {
 
 #[derive(Component)]
 pub struct Patty {
+    pub protein: Protein,
     pub slot: usize,
     /// Cook level of both sides; side 0 starts face down.
     pub sides: [f32; 2],
@@ -92,20 +100,31 @@ pub enum Phase {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Destination {
-    Order,
-    /// A spot on the warmer tray.
-    Warmer(usize),
+    /// The tray that goes to the prep table.
+    Pass,
     Bin,
 }
 
 impl Destination {
     fn target(self) -> Vec3 {
         match self {
-            Destination::Order => ORDER_PASS,
-            Destination::Warmer(spot) => WARMER_SPOTS[spot] + Vec3::Y * 0.1,
+            Destination::Pass => PASS_TRAY + Vec3::Y * 0.2,
             Destination::Bin => BIN_MOUTH - Vec3::Y * 0.6,
         }
     }
+}
+
+/// How thick a patty or a rasher of bacon is.
+fn thickness(protein: Protein) -> f32 {
+    match protein {
+        Protein::Patty => 0.34,
+        Protein::Bacon => 0.14,
+    }
+}
+
+/// Height of the food's centre when it lies on the grate.
+fn rest_height(protein: Protein) -> f32 {
+    thickness(protein) / 2.0 + 0.01
 }
 
 impl Patty {
@@ -127,7 +146,8 @@ impl Patty {
     }
 }
 
-/// Per-patty materials, recoloured as each side cooks.
+/// Per-item materials, recoloured as each side cooks: the meat, and the grill
+/// marks of a patty or the streaks of fat in bacon.
 #[derive(Component)]
 struct PattyLook {
     meat: [Handle<StandardMaterial>; 2],
@@ -138,14 +158,23 @@ struct PattyLook {
 struct PattyAssets {
     half: Handle<Mesh>,
     marks: Vec<(Handle<Mesh>, f32)>,
+    /// Half the thickness of a rasher of bacon, and the streak of fat along it.
+    rasher: Handle<Mesh>,
+    streak: Handle<Mesh>,
 }
 
 fn load_patty_assets(mut commands: Commands, mut meshes: ResMut<Assets<Mesh>>) {
     let half = meshes.add(
-        Cylinder::new(PATTY_RADIUS, THICKNESS / 2.0)
+        Cylinder::new(PATTY_RADIUS, thickness(Protein::Patty) / 2.0)
             .mesh()
             .resolution(48),
     );
+    let rasher = meshes.add(Cuboid::new(
+        BACON_LENGTH,
+        thickness(Protein::Bacon) / 2.0,
+        BACON_WIDTH,
+    ));
+    let streak = meshes.add(Cuboid::new(BACON_LENGTH, 0.008, BACON_WIDTH * 0.28));
     let marks = MARK_OFFSETS
         .iter()
         .map(|&x| {
@@ -153,32 +182,40 @@ fn load_patty_assets(mut commands: Commands, mut meshes: ResMut<Assets<Mesh>>) {
             (meshes.add(Cuboid::new(0.09, 0.008, length)), x)
         })
         .collect();
-    commands.insert_resource(PattyAssets { half, marks });
+    commands.insert_resource(PattyAssets {
+        half,
+        marks,
+        rasher,
+        streak,
+    });
 }
 
 fn spawn_patty(
     commands: &mut Commands,
     assets: &PattyAssets,
     materials: &mut Assets<StandardMaterial>,
+    protein: Protein,
     slot: usize,
 ) -> Entity {
     let meat = [(); 2].map(|_| {
         materials.add(StandardMaterial {
-            base_color: meat_color(0.0),
+            base_color: meat_color(protein, 0.0),
             perceptual_roughness: meat_roughness(0.0),
             ..default()
         })
     });
     let marks = [(); 2].map(|_| {
         materials.add(StandardMaterial {
-            base_color: mark_color(0.0),
+            base_color: mark_color(protein, 0.0),
             perceptual_roughness: 0.9,
             ..default()
         })
     });
+    let quarter = thickness(protein) / 4.0;
     let patty = commands
         .spawn((
             Patty {
+                protein,
                 slot,
                 sides: [0.0; 2],
                 down: 0,
@@ -189,47 +226,84 @@ fn spawn_patty(
                 meat: meat.clone(),
                 marks: marks.clone(),
             },
-            Transform::from_translation(SLOTS[slot] + Vec3::Y * (REST_HEIGHT + DROP_HEIGHT)),
+            Transform::from_translation(
+                SLOTS[slot] + Vec3::Y * (rest_height(protein) + DROP_HEIGHT),
+            ),
             Visibility::default(),
         ))
         .id();
     for side in 0..2 {
         // Side 0 is the lower half with its outer face pointing down, side 1 the upper half.
         let outward = if side == 0 { -1.0 } else { 1.0 };
-        commands
-            .spawn((
-                Mesh3d(assets.half.clone()),
-                MeshMaterial3d(meat[side].clone()),
-                Transform::from_xyz(0.0, outward * THICKNESS / 4.0, 0.0),
-                ChildOf(patty),
-            ))
-            .with_children(|half| {
-                for (mesh, x) in &assets.marks {
-                    half.spawn((
-                        Mesh3d(mesh.clone()),
-                        MeshMaterial3d(marks[side].clone()),
-                        Transform::from_xyz(*x, outward * (THICKNESS / 4.0 + 0.004), 0.0),
-                        NotShadowCaster,
-                    ));
+        match protein {
+            Protein::Patty => {
+                commands
+                    .spawn((
+                        Mesh3d(assets.half.clone()),
+                        MeshMaterial3d(meat[side].clone()),
+                        Transform::from_xyz(0.0, outward * quarter, 0.0),
+                        ChildOf(patty),
+                    ))
+                    .with_children(|half| {
+                        for (mesh, x) in &assets.marks {
+                            half.spawn((
+                                Mesh3d(mesh.clone()),
+                                MeshMaterial3d(marks[side].clone()),
+                                Transform::from_xyz(*x, outward * (quarter + 0.004), 0.0),
+                                NotShadowCaster,
+                            ));
+                        }
+                    });
+            }
+            // Two rashers side by side, each with a streak of fat.
+            Protein::Bacon => {
+                for (z, turn) in [(-0.3, 0.06), (0.3, -0.04)] {
+                    commands
+                        .spawn((
+                            Mesh3d(assets.rasher.clone()),
+                            MeshMaterial3d(meat[side].clone()),
+                            Transform::from_xyz(0.0, outward * quarter, z)
+                                .with_rotation(Quat::from_rotation_y(turn)),
+                            ChildOf(patty),
+                        ))
+                        .with_child((
+                            Mesh3d(assets.streak.clone()),
+                            MeshMaterial3d(marks[side].clone()),
+                            Transform::from_xyz(0.0, outward * (quarter + 0.004), 0.03),
+                            NotShadowCaster,
+                        ));
                 }
-            });
+            }
+        }
     }
     patty
 }
 
-/// Colour of a patty side at a cook level: raw pink, golden brown, then charcoal.
-fn meat_color(level: f32) -> Color {
-    const STOPS: [(f32, Color); 5] = [
+/// Colour of a side at a cook level. Patties go from raw pink to golden brown,
+/// bacon from pale pink to crimson; both end up as charcoal.
+fn meat_color(protein: Protein, level: f32) -> Color {
+    const PATTY: [(f32, Color); 5] = [
         (0.0, Color::srgb(0.78, 0.32, 0.35)),
         (0.4, Color::srgb(0.62, 0.38, 0.32)),
         (0.85, Color::srgb(0.5, 0.29, 0.13)),
         (1.2, Color::srgb(0.26, 0.14, 0.07)),
         (1.6, Color::srgb(0.06, 0.045, 0.04)),
     ];
-    STOPS
+    const BACON: [(f32, Color); 5] = [
+        (0.0, Color::srgb(0.9, 0.5, 0.5)),
+        (0.4, Color::srgb(0.8, 0.34, 0.3)),
+        (0.85, Color::srgb(0.62, 0.17, 0.11)),
+        (1.2, Color::srgb(0.32, 0.09, 0.06)),
+        (1.6, Color::srgb(0.06, 0.045, 0.04)),
+    ];
+    let stops = match protein {
+        Protein::Patty => PATTY,
+        Protein::Bacon => BACON,
+    };
+    stops
         .windows(2)
         .find(|pair| level <= pair[1].0)
-        .map_or(STOPS[STOPS.len() - 1].1, |pair| {
+        .map_or(stops[stops.len() - 1].1, |pair| {
             let (from_level, from) = pair[0];
             let (to_level, to) = pair[1];
             let t = ((level - from_level) / (to_level - from_level)).max(0.0);
@@ -237,12 +311,22 @@ fn meat_color(level: f32) -> Color {
         })
 }
 
-/// Grill marks only show up once a side has had some time on the grate.
-fn mark_color(level: f32) -> Color {
+/// Grill marks only show up once a patty's side has had some time on the grate.
+/// The fat in bacon turns from white to golden, then chars with the rest.
+fn mark_color(protein: Protein, level: f32) -> Color {
     let sear = ((level - 0.3) / 0.6).clamp(0.0, 1.0);
-    Oklaba::from(meat_color(level))
-        .mix(&Oklaba::from(Color::srgb(0.05, 0.03, 0.02)), sear * 0.85)
-        .into()
+    match protein {
+        Protein::Patty => Oklaba::from(meat_color(protein, level))
+            .mix(&Oklaba::from(Color::srgb(0.05, 0.03, 0.02)), sear * 0.85)
+            .into(),
+        Protein::Bacon => {
+            let fat = Oklaba::from(Color::srgb(0.98, 0.88, 0.84))
+                .mix(&Oklaba::from(Color::srgb(0.93, 0.72, 0.48)), sear);
+            let char = ((level - rules::OVERDONE_AT) / 0.6).clamp(0.0, 1.0);
+            fat.mix(&Oklaba::from(meat_color(protein, level)), char)
+                .into()
+        }
+    }
 }
 
 /// Raw meat is glossy, charcoal is dull.
@@ -271,35 +355,65 @@ fn clear_grill(
     mut commands: Commands,
     patties: Query<Entity, With<Patty>>,
     mut grill: ResMut<Grill>,
+    mut load: ResMut<GrillLoad>,
 ) {
     for patty in &patties {
         commands.entity(patty).despawn();
     }
     *grill = Grill::default();
+    *load = GrillLoad::default();
 }
 
 #[allow(clippy::too_many_arguments)]
 fn handle_clicks(
     mut commands: Commands,
     mouse: Res<ButtonInput<MouseButton>>,
+    station: Res<Station>,
+    pointer: Res<Cursor>,
     cursor: Res<GrillCursor>,
     assets: Res<PattyAssets>,
     mut materials: ResMut<Assets<StandardMaterial>>,
     mut grill: ResMut<Grill>,
+    mut load: ResMut<GrillLoad>,
+    mut pantry: ResMut<Pantry>,
     mut patties: Query<(&mut Patty, &Transform)>,
-    mut orders: Query<&mut Order>,
-    mut warmer: ResMut<Warmer>,
     mut shift: ResMut<Shift>,
     mut feedback: Feedback,
 ) {
-    if !mouse.just_pressed(MouseButton::Left) {
+    if !mouse.just_pressed(MouseButton::Left) || !station.is_at(View::Grill) {
         return;
+    }
+    // A click on a raw tray chooses what goes on the grill next.
+    if let Some(ray) = pointer.ray() {
+        let half_size = Vec3::new(RAW_TRAY_SIZE.x / 2.0, 0.4, RAW_TRAY_SIZE.y / 2.0);
+        for (protein, at) in RAW_TRAYS {
+            if ray_hits_box(ray, at + Vec3::Y * 0.3, half_size).is_some() {
+                load.0 = protein;
+                feedback.sfx.write(PlaySfx::pitched(Sfx::Flip, 1.3));
+                return;
+            }
+        }
     }
     let Some(slot) = cursor.slot else {
         return;
     };
     let Some(entity) = grill.slots[slot] else {
-        grill.slots[slot] = Some(spawn_patty(&mut commands, &assets, &mut materials, slot));
+        if pantry.take_raw(load.0) {
+            grill.slots[slot] = Some(spawn_patty(
+                &mut commands,
+                &assets,
+                &mut materials,
+                load.0,
+                slot,
+            ));
+        } else {
+            feedback.sfx.write(Sfx::Nope.into());
+            feedback.popups.write(Popup::world(
+                format!("NO RAW {} - RESTOCK IN STORAGE", load.0.ingredient().name()),
+                SLOTS[slot],
+                RED,
+            ));
+        }
         return;
     };
     let Ok((mut patty, transform)) = patties.get_mut(entity) else {
@@ -312,13 +426,14 @@ fn handle_clicks(
             feedback.sfx.write(Sfx::Flip.into());
         }
         (Phase::Cooking, Verdict::Ready(quality)) => {
-            let Some(claim) = orders::claim(&mut orders, &mut warmer) else {
+            if !pantry.has_room_for_cooked(patty.protein) {
                 feedback.sfx.write(Sfx::Nope.into());
                 feedback
                     .popups
-                    .write(Popup::world("WARMER FULL!", position, RED));
+                    .write(Popup::world("PREP TRAY FULL!", position, RED));
                 return;
-            };
+            }
+            pantry.add_cooked(patty.protein, quality);
             let points = shift.serve(quality);
             let (label, color) = match quality {
                 Quality::Perfect if shift.streak > 1 => {
@@ -336,11 +451,7 @@ fn handle_clicks(
             feedback
                 .bursts
                 .write(Burst::new(ParticleKind::Sparkle, position, 16).spread(0.5));
-            let destination = match claim {
-                Claim::Order => Destination::Order,
-                Claim::Warmer(spot) => Destination::Warmer(spot),
-            };
-            send_off(&mut patty, &mut grill, position, destination);
+            send_off(&mut patty, &mut grill, position, Destination::Pass);
         }
         (Phase::Cooking, Verdict::Ruined) => {
             shift.trash();
@@ -370,9 +481,10 @@ fn cook(
     let dt = time.delta_secs();
     for (mut patty, transform) in &mut patties {
         let down = patty.down;
+        let rate = patty.protein.cook_rate();
         match patty.phase {
             Phase::Cooking => {
-                patty.sides[down] += rules::COOK_RATE * dt;
+                patty.sides[down] += rate * dt;
                 if patty.sides[down] >= rules::IGNITES_AT {
                     patty.phase = Phase::OnFire { t: 0.0 };
                     shift.strike();
@@ -385,7 +497,7 @@ fn cook(
                 }
             }
             Phase::OnFire { t } => {
-                patty.sides[down] += rules::COOK_RATE * dt;
+                patty.sides[down] += rate * dt;
                 patty.phase = Phase::OnFire { t: t + dt };
                 if t + dt >= FIRE_TIME {
                     send_off(
@@ -409,7 +521,7 @@ fn animate(
 ) {
     let dt = time.delta_secs();
     for (entity, mut patty, mut transform) in &mut patties {
-        let home = SLOTS[patty.slot] + Vec3::Y * REST_HEIGHT;
+        let home = SLOTS[patty.slot] + Vec3::Y * rest_height(patty.protein);
         match patty.phase {
             Phase::Dropping { t } => {
                 let t = t + dt;
@@ -444,7 +556,7 @@ fn animate(
                 let squash = (patty.squash / SQUASH_TIME).powi(2);
                 transform.scale =
                     Vec3::new(1.0 + 0.12 * squash, 1.0 - 0.3 * squash, 1.0 + 0.12 * squash);
-                transform.translation = home - Vec3::Y * THICKNESS * 0.15 * squash;
+                transform.translation = home - Vec3::Y * thickness(patty.protein) * 0.15 * squash;
             }
             Phase::Leaving {
                 t,
@@ -454,8 +566,7 @@ fn animate(
                 let t = t + dt;
                 let progress = (t / LEAVE_TIME).min(1.0);
                 let (arc, end_scale, spin) = match destination {
-                    Destination::Order => (1.0, 0.15, 0.0),
-                    Destination::Warmer(_) => (1.5, 0.45, 0.0),
+                    Destination::Pass => (1.5, 0.45, 0.0),
                     Destination::Bin => (2.0, 0.6, 9.0),
                 };
                 transform.translation = from.lerp(destination.target(), smoothstep(progress))
@@ -478,10 +589,9 @@ fn animate(
                             .bursts
                             .write(Burst::new(ParticleKind::Steam, BIN_MOUTH, 5).spread(0.4));
                     }
-                    Destination::Warmer(_) => {
+                    Destination::Pass => {
                         feedback.sfx.write(Sfx::Warmer.into());
                     }
-                    Destination::Order => {}
                 }
             }
         }
@@ -515,7 +625,7 @@ fn emit_particles(
         }
     };
     for (patty, transform) in &patties {
-        let top = transform.translation + Vec3::Y * THICKNESS / 2.0;
+        let top = transform.translation + Vec3::Y * thickness(patty.protein) / 2.0;
         match patty.phase {
             Phase::Cooking => {
                 let rim = rng.direction() * PATTY_RADIUS;
@@ -551,11 +661,11 @@ fn update_looks(
     for (patty, look) in &patties {
         for (side, &level) in patty.sides.iter().enumerate() {
             if let Some(mut meat) = materials.get_mut(&look.meat[side]) {
-                meat.base_color = meat_color(level);
+                meat.base_color = meat_color(patty.protein, level);
                 meat.perceptual_roughness = meat_roughness(level);
             }
             if let Some(mut marks) = materials.get_mut(&look.marks[side]) {
-                marks.base_color = mark_color(level);
+                marks.base_color = mark_color(patty.protein, level);
             }
         }
     }
@@ -595,5 +705,28 @@ fn highlight_slots(
             material.0 = handle.clone();
         }
         visibility.set_if_neq(Visibility::Inherited);
+    }
+}
+
+/// Flashes the grill's tab when something on it needs a hand, and frames the
+/// raw tray the grill is being loaded from.
+fn call_for_attention(
+    patties: Query<&Patty>,
+    load: Res<GrillLoad>,
+    mut alerts: ResMut<Alerts>,
+    mut markers: Query<(&LoadMarker, &mut Visibility)>,
+) {
+    let needs_a_hand = patties.iter().any(|patty| match patty.phase {
+        Phase::OnFire { .. } => true,
+        Phase::Cooking => patty.verdict() != Verdict::Cooking,
+        _ => false,
+    });
+    alerts.set(View::Grill, needs_a_hand);
+    for (marker, mut visibility) in &mut markers {
+        visibility.set_if_neq(if marker.0 == load.0 {
+            Visibility::Inherited
+        } else {
+            Visibility::Hidden
+        });
     }
 }

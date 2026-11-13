@@ -1,16 +1,22 @@
-//! Burger Flipper: a small arcade cooking game built with Bevy.
+//! Burger Flipper: a small restaurant game built with Bevy.
 //!
-//! Drop patties on the grill, flip them at the right moment and serve them
-//! before the customers run out of patience. Three strikes and you're fired.
+//! Take orders at the counter, stock up in storage, grill patties and bacon,
+//! and stack burgers at the prep table before the customers run out of
+//! patience. Three strikes and you're fired.
 
 mod audio;
+mod counter;
 mod effects;
 mod game;
 mod hud;
+mod ingredients;
 mod kitchen;
 mod orders;
 mod patty;
+mod prep;
 mod rules;
+mod stations;
+mod storage;
 
 use bevy::prelude::*;
 
@@ -38,9 +44,14 @@ fn main() {
             game::plugin,
             audio::plugin,
             effects::plugin,
+            ingredients::plugin,
+            stations::plugin,
             kitchen::plugin,
             patty::plugin,
             orders::plugin,
+            counter::plugin,
+            storage::plugin,
+            prep::plugin,
             hud::plugin,
         ))
         .run();

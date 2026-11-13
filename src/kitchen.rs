@@ -1,5 +1,5 @@
-//! The set: camera, lights, counter, grill, bin and warmer, plus picking
-//! which grill slot the mouse points at.
+//! The grill station: camera, lights, grill, bin, raw trays and the pass to the
+//! prep table, plus picking which grill slot the mouse points at.
 
 use std::f32::consts::FRAC_PI_2;
 
@@ -7,12 +7,13 @@ use bevy::input::InputSystems;
 use bevy::light::{CascadeShadowConfigBuilder, NotShadowCaster};
 use bevy::post_process::bloom::Bloom;
 use bevy::prelude::*;
-use bevy::window::PrimaryWindow;
 
 use crate::effects::CameraRig;
 use crate::game::GameRng;
-use crate::orders::Warmer;
-use crate::patty::{Destination, Patty, Phase};
+use crate::hud::world_label;
+use crate::ingredients::{IngredientAssets, Pile, Shelf, StockLabel, spawn_tray};
+use crate::rules::Protein;
+use crate::stations::{self, Cursor, Station, View};
 
 /// Centres of the six cooking spots, back row first.
 pub const SLOTS: [Vec3; 6] = [
@@ -30,15 +31,14 @@ const PICK_HEIGHT: f32 = 0.3;
 
 /// Centre of the trash bin's opening.
 pub const BIN_MOUTH: Vec3 = Vec3::new(-5.45, 0.95, 1.2);
-/// Where served patties fly off to: up towards the order rail.
-pub const ORDER_PASS: Vec3 = Vec3::new(0.0, 4.5, -4.5);
-/// Spots on the warmer tray for spare patties.
-pub const WARMER_SPOTS: [Vec3; 4] = [
-    Vec3::new(5.25, -0.38, 0.45),
-    Vec3::new(6.05, -0.38, 0.45),
-    Vec3::new(5.25, -0.38, 1.3),
-    Vec3::new(6.05, -0.38, 1.3),
+/// The tray cooked food is sent to; it ends up on the prep table.
+pub const PASS_TRAY: Vec3 = Vec3::new(5.65, -0.5, 0.9);
+/// Trays of raw patties and bacon next to the grill.
+pub const RAW_TRAYS: [(Protein, Vec3); 2] = [
+    (Protein::Patty, Vec3::new(-5.7, -0.5, -3.3)),
+    (Protein::Bacon, Vec3::new(-5.7, -0.5, -1.6)),
 ];
+pub const RAW_TRAY_SIZE: Vec2 = Vec2::new(1.7, 1.5);
 
 const GRILL_SIZE: Vec2 = Vec2::new(8.2, 5.0);
 const COAL_GLOW: [LinearRgba; 3] = [
@@ -62,11 +62,16 @@ pub fn plugin(app: &mut App) {
                 spawn_counter,
                 spawn_grill,
                 spawn_bin,
-                spawn_warmer,
+                spawn_trays,
             ),
         )
-        .add_systems(PreUpdate, track_cursor.after(InputSystems))
-        .add_systems(Update, (flicker_coals, fill_warmer_tray));
+        .add_systems(
+            PreUpdate,
+            track_cursor
+                .after(InputSystems)
+                .after(stations::track_cursor),
+        )
+        .add_systems(Update, flicker_coals);
 }
 
 #[derive(Component)]
@@ -94,11 +99,11 @@ pub struct RingMaterials {
 #[derive(Resource)]
 struct CoalMaterials([Handle<StandardMaterial>; 3]);
 
-/// One of the little burgers shown on the warmer tray.
+/// Glowing frame under the raw tray the grill is being loaded from.
 #[derive(Component)]
-struct WarmerBurger(usize);
+pub struct LoadMarker(pub Protein);
 
-fn surface(color: Color, metallic: f32, roughness: f32) -> StandardMaterial {
+pub fn surface(color: Color, metallic: f32, roughness: f32) -> StandardMaterial {
     StandardMaterial {
         base_color: color,
         metallic,
@@ -108,7 +113,7 @@ fn surface(color: Color, metallic: f32, roughness: f32) -> StandardMaterial {
 }
 
 fn spawn_camera_and_lights(mut commands: Commands) {
-    let view = Transform::from_xyz(0.0, 8.4, 6.5).looking_at(Vec3::new(0.0, -0.7, -1.2), Vec3::Y);
+    let view = View::Grill.camera();
     commands.spawn((
         Camera3d::default(),
         view,
@@ -148,17 +153,35 @@ fn spawn_counter(
     mut meshes: ResMut<Assets<Mesh>>,
     mut materials: ResMut<Assets<StandardMaterial>>,
 ) {
-    // Counter top.
+    spawn_backdrop(
+        &mut commands,
+        &mut meshes,
+        &mut materials,
+        Vec3::ZERO,
+        surface(Color::srgb(0.24, 0.25, 0.27), 0.3, 0.45),
+        Color::srgb(0.12, 0.3, 0.29),
+    );
+}
+
+/// A worktop with a diner-style tiled wall behind it: coloured tiles with light
+/// grout, every row offset by half a tile. The worktop's surface is 0.55 below `origin`.
+pub fn spawn_backdrop(
+    commands: &mut Commands,
+    meshes: &mut Assets<Mesh>,
+    materials: &mut Assets<StandardMaterial>,
+    origin: Vec3,
+    worktop: StandardMaterial,
+    tiles: Color,
+) {
     commands.spawn((
         Mesh3d(meshes.add(Cuboid::new(30.0, 1.0, 16.0))),
-        MeshMaterial3d(materials.add(surface(Color::srgb(0.24, 0.25, 0.27), 0.3, 0.45))),
-        Transform::from_xyz(0.0, -1.05, 0.0),
+        MeshMaterial3d(materials.add(worktop)),
+        Transform::from_translation(origin + Vec3::new(0.0, -1.05, 0.0)),
     ));
-    // Diner-style tiled back wall: dark tiles with light grout, every row offset by half a tile.
     commands.spawn((
         Mesh3d(meshes.add(Cuboid::new(30.0, 8.0, 0.3))),
-        MeshMaterial3d(materials.add(surface(Color::srgb(0.12, 0.3, 0.29), 0.0, 0.25))),
-        Transform::from_xyz(0.0, 3.4, -6.0),
+        MeshMaterial3d(materials.add(surface(tiles, 0.0, 0.25))),
+        Transform::from_translation(origin + Vec3::new(0.0, 3.4, -6.0)),
     ));
     let grout = materials.add(surface(Color::srgb(0.75, 0.73, 0.68), 0.0, 0.9));
     let row_line = meshes.add(Cuboid::new(30.0, 0.04, 0.04));
@@ -168,14 +191,16 @@ fn spawn_counter(
         commands.spawn((
             Mesh3d(row_line.clone()),
             MeshMaterial3d(grout.clone()),
-            Transform::from_xyz(0.0, y, -5.84),
+            Transform::from_translation(origin + Vec3::new(0.0, y, -5.84)),
         ));
         let offset = if row % 2 == 0 { 0.0 } else { 0.5 };
         for column in -12..12 {
             commands.spawn((
                 Mesh3d(joint.clone()),
                 MeshMaterial3d(grout.clone()),
-                Transform::from_xyz(column as f32 + offset, y + 0.25, -5.84),
+                Transform::from_translation(
+                    origin + Vec3::new(column as f32 + offset, y + 0.25, -5.84),
+                ),
             ));
         }
     }
@@ -340,79 +365,81 @@ fn spawn_bin(
         MeshMaterial3d(materials.add(surface(Color::srgb(0.25, 0.36, 0.3), 0.1, 0.5))),
         Transform::from_translation(BIN_MOUTH),
     ));
+    commands.spawn(world_label(
+        "TRASH",
+        BIN_MOUTH.with_y(-0.55) + Vec3::Z * 1.0,
+    ));
 }
 
-fn spawn_warmer(
+fn spawn_trays(
     mut commands: Commands,
-    mut meshes: ResMut<Assets<Mesh>>,
+    assets: Res<IngredientAssets>,
     mut materials: ResMut<Assets<StandardMaterial>>,
 ) {
-    let tray_centre = warmer_centre();
-    commands.spawn((
-        Mesh3d(meshes.add(Cuboid::new(1.8, 0.1, 1.8))),
-        MeshMaterial3d(materials.add(surface(Color::srgb(0.6, 0.61, 0.64), 0.8, 0.3))),
-        Transform::from_xyz(tray_centre.x, -0.5, tray_centre.z),
-    ));
-    // Heated plate the spare burgers sit on.
-    commands.spawn((
-        Mesh3d(meshes.add(Cuboid::new(1.6, 0.02, 1.6))),
+    // Raw patties and bacon, stocked from storage.
+    let marker = materials.add(StandardMaterial {
+        base_color: Color::srgb(1.0, 0.8, 0.2),
+        emissive: LinearRgba::rgb(2.5, 1.6, 0.2),
+        ..default()
+    });
+    for (protein, at) in RAW_TRAYS {
+        let tray = spawn_tray(&mut commands, &assets, at, RAW_TRAY_SIZE);
+        commands.entity(tray).with_child((
+            Transform::from_xyz(0.0, 0.0, 0.0),
+            Visibility::default(),
+            Pile::new(protein.ingredient(), Shelf::Stock, 0.62),
+        ));
+        commands.spawn((
+            Mesh3d(assets.cube.clone()),
+            MeshMaterial3d(marker.clone()),
+            Transform::from_translation(at - Vec3::Y * 0.04).with_scale(Vec3::new(
+                RAW_TRAY_SIZE.x + 0.22,
+                0.02,
+                RAW_TRAY_SIZE.y + 0.22,
+            )),
+            NotShadowCaster,
+            Visibility::Hidden,
+            LoadMarker(protein),
+        ));
+        commands.spawn((
+            world_label("", at + Vec3::new(0.0, 0.0, RAW_TRAY_SIZE.y / 2.0)),
+            StockLabel {
+                ingredient: protein.ingredient(),
+                shelf: Shelf::Stock,
+            },
+        ));
+    }
+
+    // The pass: cooked food lands here on its way to the prep table.
+    let size = Vec2::new(1.9, 1.9);
+    let pass = spawn_tray(&mut commands, &assets, PASS_TRAY, size);
+    commands.entity(pass).with_child((
+        Mesh3d(assets.cube.clone()),
         MeshMaterial3d(materials.add(StandardMaterial {
             base_color: Color::srgb(0.25, 0.08, 0.04),
             emissive: LinearRgba::rgb(0.35, 0.06, 0.01),
             perceptual_roughness: 0.6,
             ..default()
         })),
-        Transform::from_xyz(tray_centre.x, -0.44, tray_centre.z),
+        Transform::from_xyz(0.0, 0.01, 0.0).with_scale(Vec3::new(size.x - 0.2, 0.02, size.y - 0.2)),
     ));
-
-    let bun_mesh = meshes.add(Sphere::new(0.34).mesh().uv(24, 12));
-    let base_mesh = meshes.add(Cylinder::new(0.34, 0.1));
-    let patty_mesh = meshes.add(Cylinder::new(0.37, 0.11));
-    let bun = materials.add(surface(Color::srgb(0.86, 0.58, 0.25), 0.0, 0.6));
-    let meat = materials.add(surface(Color::srgb(0.4, 0.22, 0.1), 0.0, 0.8));
-    for (index, spot) in WARMER_SPOTS.iter().enumerate() {
-        commands.spawn((
-            Transform::from_translation(*spot),
-            Visibility::Hidden,
-            WarmerBurger(index),
-            children![
-                (
-                    Mesh3d(base_mesh.clone()),
-                    MeshMaterial3d(bun.clone()),
-                    Transform::default(),
-                ),
-                (
-                    Mesh3d(patty_mesh.clone()),
-                    MeshMaterial3d(meat.clone()),
-                    Transform::from_xyz(0.0, 0.1, 0.0),
-                ),
-                (
-                    Mesh3d(bun_mesh.clone()),
-                    MeshMaterial3d(bun.clone()),
-                    Transform::from_xyz(0.0, 0.15, 0.0).with_scale(Vec3::new(1.0, 0.6, 1.0)),
-                ),
-            ],
+    for (protein, x) in Protein::ALL.into_iter().zip([-0.45, 0.45]) {
+        commands.entity(pass).with_child((
+            Transform::from_xyz(x, 0.02, 0.0),
+            Visibility::default(),
+            Pile::new(protein.ingredient(), Shelf::Ready, 0.42),
         ));
     }
+    commands.spawn(world_label(
+        "TO PREP TABLE",
+        PASS_TRAY + Vec3::Z * (size.y / 2.0 + 0.1),
+    ));
 }
 
-/// Middle of the warmer tray.
-pub fn warmer_centre() -> Vec3 {
-    (WARMER_SPOTS[0] + WARMER_SPOTS[3]) / 2.0
-}
-
-fn track_cursor(
-    window: Single<&Window, With<PrimaryWindow>>,
-    camera: Single<(&Camera, &GlobalTransform), With<MainCamera>>,
-    mut cursor: ResMut<GrillCursor>,
-) {
-    let (camera, camera_transform) = *camera;
-    cursor.slot = window
-        .cursor_position()
-        .and_then(|position| camera.viewport_to_world(camera_transform, position).ok())
-        .and_then(|ray| {
-            ray.plane_intersection_point(Vec3::Y * PICK_HEIGHT, InfinitePlane3d::new(Vec3::Y))
-        })
+fn track_cursor(pointer: Res<Cursor>, station: Res<Station>, mut cursor: ResMut<GrillCursor>) {
+    let slot = pointer
+        .on_plane(PICK_HEIGHT)
+        .filter(|_| station.is_at(View::Grill))
         .and_then(|point| {
             SLOTS
                 .iter()
@@ -422,6 +449,9 @@ fn track_cursor(
                 .min_by(|a, b| a.1.total_cmp(&b.1))
                 .map(|(index, _)| index)
         });
+    if cursor.slot != slot {
+        cursor.slot = slot;
+    }
 }
 
 fn flicker_coals(
@@ -436,33 +466,5 @@ fn flicker_coals(
         if let Some(mut material) = materials.get_mut(handle) {
             material.emissive = COAL_GLOW[index] * glow;
         }
-    }
-}
-
-/// Shows one little burger on the warmer tray per spare patty, once it has landed.
-fn fill_warmer_tray(
-    warmer: Res<Warmer>,
-    patties: Query<&Patty>,
-    mut burgers: Query<(&WarmerBurger, &mut Visibility)>,
-) {
-    let in_flight = patties
-        .iter()
-        .filter(|patty| {
-            matches!(
-                patty.phase,
-                Phase::Leaving {
-                    destination: Destination::Warmer(_),
-                    ..
-                }
-            )
-        })
-        .count() as u32;
-    let landed = warmer.count.saturating_sub(in_flight) as usize;
-    for (burger, mut visibility) in &mut burgers {
-        visibility.set_if_neq(if burger.0 < landed {
-            Visibility::Inherited
-        } else {
-            Visibility::Hidden
-        });
     }
 }

@@ -7,8 +7,7 @@ use bevy::prelude::*;
 use crate::GameState;
 use crate::audio::{PlaySfx, Sfx};
 use crate::game::{HighScore, Shift};
-use crate::kitchen::{BIN_MOUTH, MainCamera, SLOTS, warmer_centre};
-use crate::orders::Warmer;
+use crate::kitchen::{MainCamera, SLOTS};
 use crate::patty::{PATTY_RADIUS, Patty, Phase};
 use crate::rules::{self, Verdict};
 
@@ -16,28 +15,21 @@ pub const GREEN: Color = Color::srgb(0.35, 0.9, 0.35);
 pub const YELLOW: Color = Color::srgb(1.0, 0.85, 0.2);
 pub const ORANGE: Color = Color::srgb(1.0, 0.55, 0.15);
 pub const RED: Color = Color::srgb(1.0, 0.28, 0.22);
-const GOLD: Color = Color::srgb(1.0, 0.75, 0.25);
-const CREAM: Color = Color::srgb(1.0, 0.95, 0.85);
+pub const GOLD: Color = Color::srgb(1.0, 0.75, 0.25);
+pub const CREAM: Color = Color::srgb(1.0, 0.95, 0.85);
 const PANEL: Color = Color::srgba(0.08, 0.06, 0.05, 0.85);
 
 const POPUP_LIFETIME: f32 = 1.3;
 const POPUP_WIDTH: f32 = 520.0;
 const GAUGE_WIDTH: f32 = 96.0;
+const WORLD_LABEL_WIDTH: f32 = 220.0;
 /// Seconds the game-over screen ignores clicks, so a frantic click doesn't skip it.
 const GAME_OVER_LOCK: f32 = 1.2;
 
 pub fn plugin(app: &mut App) {
     app.add_message::<Popup>()
         .init_resource::<InputLock>()
-        .add_systems(
-            Startup,
-            (
-                spawn_score_panel,
-                spawn_controls_hint,
-                spawn_pause_screen,
-                spawn_world_labels,
-            ),
-        )
+        .add_systems(Startup, (spawn_score_panel, spawn_pause_screen))
         .add_systems(OnEnter(GameState::Title), spawn_title_screen)
         .add_systems(OnEnter(GameState::GameOver), spawn_game_over_screen)
         .add_systems(
@@ -97,6 +89,11 @@ impl Popup {
         self.size *= 1.4;
         self
     }
+
+    pub fn small(mut self) -> Self {
+        self.size *= 0.7;
+        self
+    }
 }
 
 #[derive(Component)]
@@ -118,16 +115,30 @@ struct Gauge {
 enum Readout {
     Score,
     Streak,
-    Warmer,
+    Orders,
     Clock,
 }
 
 #[derive(Component)]
 struct StrikeBox(u32);
 
-/// Caption pinned to a point in the kitchen.
+/// Caption pinned to a point in the restaurant.
 #[derive(Component)]
-struct WorldLabel(Vec3);
+pub struct WorldLabel(pub Vec3);
+
+/// A caption that stays just below a point in the 3D scene.
+pub fn world_label(text: impl Into<String>, at: Vec3) -> impl Bundle {
+    (
+        label(text, 15.0, CREAM.with_alpha(0.85)),
+        Node {
+            position_type: PositionType::Absolute,
+            width: px(WORLD_LABEL_WIDTH),
+            ..default()
+        },
+        Visibility::Hidden,
+        WorldLabel(at),
+    )
+}
 
 #[derive(Component)]
 struct PauseScreen;
@@ -139,7 +150,7 @@ struct Blink;
 #[derive(Resource, Default)]
 struct InputLock(f32);
 
-fn label(value: impl Into<String>, size: f32, color: Color) -> impl Bundle {
+pub fn label(value: impl Into<String>, size: f32, color: Color) -> impl Bundle {
     (
         Text::new(value),
         TextFont::from_font_size(FontSize::Px(size)),
@@ -241,7 +252,7 @@ fn spawn_score_panel(mut commands: Commands) {
                 Text::new(""),
                 TextFont::from_font_size(FontSize::Px(14.0)),
                 TextColor(CREAM),
-                Readout::Warmer,
+                Readout::Orders,
             ),
             (
                 Text::new(""),
@@ -253,42 +264,6 @@ fn spawn_score_panel(mut commands: Commands) {
     ));
 }
 
-fn spawn_controls_hint(mut commands: Commands) {
-    commands.spawn((
-        Node {
-            position_type: PositionType::Absolute,
-            bottom: px(10),
-            width: percent(100),
-            justify_content: JustifyContent::Center,
-            ..default()
-        },
-        children![label(
-            "CLICK GRILL: drop a patty   |   CLICK PATTY: flip it, or serve it when READY   |   P: pause",
-            14.0,
-            CREAM.with_alpha(0.75),
-        )],
-    ));
-}
-
-fn spawn_world_labels(mut commands: Commands) {
-    let captions = [
-        ("TRASH", BIN_MOUTH.with_y(-0.55) + Vec3::Z * 1.0),
-        ("WARMER", warmer_centre().with_y(-0.45) + Vec3::Z * 1.1),
-    ];
-    for (text, at) in captions {
-        commands.spawn((
-            label(text, 15.0, CREAM.with_alpha(0.8)),
-            Node {
-                position_type: PositionType::Absolute,
-                width: px(160),
-                ..default()
-            },
-            Visibility::Hidden,
-            WorldLabel(at),
-        ));
-    }
-}
-
 fn place_world_labels(
     camera: Single<(&Camera, &GlobalTransform), With<MainCamera>>,
     mut labels: Query<(&WorldLabel, &mut Node, &mut Visibility)>,
@@ -296,9 +271,10 @@ fn place_world_labels(
     let (camera, camera_transform) = *camera;
     for (label, mut node, mut visibility) in &mut labels {
         let Ok(position) = camera.world_to_viewport(camera_transform, label.0) else {
+            visibility.set_if_neq(Visibility::Hidden);
             continue;
         };
-        node.left = px(position.x - 80.0);
+        node.left = px(position.x - WORLD_LABEL_WIDTH / 2.0);
         node.top = px(position.y);
         visibility.set_if_neq(Visibility::Inherited);
     }
@@ -320,12 +296,14 @@ fn spawn_pause_screen(mut commands: Commands) {
 
 fn spawn_title_screen(mut commands: Commands, high_score: Res<HighScore>) {
     let rules_text = [
-        "1. Click an empty spot on the grill to drop a patty.",
-        "2. The gauge under a patty shows the side touching the grill.",
-        "3. Flip it when the gauge reaches green.",
-        "4. When it says READY, click it to serve the oldest order.",
-        "5. Customers who wait too long and patties that catch fire",
-        "   are strikes. Three strikes and you're fired!",
+        "1. COUNTER: click a customer in line to take their order.",
+        "2. STORAGE: click crates to load ingredients onto your trays.",
+        "3. GRILLING: cook patties and bacon. Flip on green, then send",
+        "   them to the prep table when they say READY.",
+        "4. PREP TABLE: drag ingredients onto the plate to match the",
+        "   ticket, then ring the bell to serve.",
+        "5. Customers who give up, wrong burgers and grill fires are",
+        "   strikes. Three strikes and you're fired!",
     ];
     commands
         .spawn((
@@ -336,7 +314,7 @@ fn spawn_title_screen(mut commands: Commands, high_score: Res<HighScore>) {
         ))
         .with_children(|screen| {
             screen.spawn(label("BURGER FLIPPER", 84.0, GOLD));
-            screen.spawn(label("Flip 'em. Serve 'em. Don't burn 'em.", 24.0, CREAM));
+            screen.spawn(label("Take orders. Grill. Stack. Serve.", 24.0, CREAM));
             screen
                 .spawn((
                     Node {
@@ -377,11 +355,11 @@ fn spawn_game_over_screen(
     sfx.write(Sfx::GameOver.into());
     let seconds = shift.elapsed as u32;
     let stats = [
+        format!("Burgers served: {}", shift.orders_filled),
         format!(
-            "Patties served: {} ({} perfect)",
+            "Patties and bacon grilled: {} ({} perfect)",
             shift.served, shift.perfect
         ),
-        format!("Orders filled: {}", shift.orders_filled),
         format!("Best perfect streak: x{}", shift.best_streak),
         format!("Shift length: {}:{:02}", seconds / 60, seconds % 60),
     ];
@@ -429,7 +407,6 @@ fn start_shift_on_click(
 
 fn update_score_panel(
     shift: Res<Shift>,
-    warmer: Res<Warmer>,
     mut readouts: Query<(&Readout, &mut Text)>,
     mut strikes: Query<(
         &StrikeBox,
@@ -443,7 +420,7 @@ fn update_score_panel(
             Readout::Score => shift.score.to_string(),
             Readout::Streak if shift.streak > 1 => format!("PERFECT STREAK x{}", shift.streak),
             Readout::Streak => String::new(),
-            Readout::Warmer => format!("WARMER {}/{}", warmer.count, rules::WARMER_CAPACITY),
+            Readout::Orders => format!("BURGERS SERVED {}", shift.orders_filled),
             Readout::Clock => {
                 let seconds = shift.elapsed as u32;
                 format!("SHIFT {}:{:02}", seconds / 60, seconds % 60)

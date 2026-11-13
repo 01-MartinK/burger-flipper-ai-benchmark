@@ -2,24 +2,124 @@
 //!
 //! Nothing in here touches the ECS, so the rules can be unit tested directly.
 
-/// Cook level gained per second by the side touching the grill.
-pub const COOK_RATE: f32 = 0.2;
+/// Cook level gained per second by the side of a patty touching the grill. Slow
+/// enough to step away to another station while a side cooks.
+pub const COOK_RATE: f32 = 0.11;
 /// A side is cooked once it reaches this level...
 pub const DONE_AT: f32 = 0.7;
 /// ...stays perfect until this level...
 pub const OVERDONE_AT: f32 = 1.0;
 /// ...and is ruined from here on.
 pub const BURNT_AT: f32 = 1.3;
-/// A neglected patty bursts into flames at this level.
+/// Neglected food bursts into flames at this level.
 pub const IGNITES_AT: f32 = 1.8;
-/// Highest cook level shown on a patty's gauge.
+/// Highest cook level shown on a gauge.
 pub const GAUGE_MAX: f32 = 1.5;
 
 pub const MAX_STRIKES: u32 = 3;
 pub const MAX_STREAK: u32 = 5;
-pub const MAX_OPEN_ORDERS: usize = 6;
-pub const WARMER_CAPACITY: u32 = 4;
 pub const TRASH_PENALTY: i32 = 25;
+
+/// Customers who can stand in line at the counter.
+pub const QUEUE_SPOTS: usize = 4;
+/// Customers who can wait for their food at once, which is also the number of open tickets.
+pub const MAX_OPEN_ORDERS: usize = 5;
+/// Most portions of one ingredient a tray holds.
+pub const TRAY_CAPACITY: u32 = 12;
+/// Portions a storage crate hands out per click.
+pub const PACK_SIZE: u32 = 4;
+/// Most cooked patties (or bacon) that fit on the prep table.
+pub const COOKED_CAPACITY: usize = 6;
+/// Stock on the trays when a shift starts, indexed like [`Ingredient::ALL`].
+pub const STARTER_STOCK: [u32; 7] = [6, 3, 4, 4, 4, 4, 2];
+/// Most layers in an ordered burger, buns included.
+pub const MAX_LAYERS: usize = 8;
+/// Bacon and double patties only show up on tickets after these many seconds.
+pub const BACON_FROM: f32 = 40.0;
+pub const DOUBLE_FROM: f32 = 90.0;
+/// A burger whose build score is below this gets sent back.
+pub const REJECT_BELOW: u32 = 40;
+pub const PERFECT_ORDER_BONUS: i32 = 150;
+
+/// Everything a burger can be made of.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum Ingredient {
+    Bun,
+    Patty,
+    Cheese,
+    Lettuce,
+    Tomato,
+    Onions,
+    Bacon,
+}
+
+impl Ingredient {
+    pub const ALL: [Self; 7] = [
+        Self::Bun,
+        Self::Patty,
+        Self::Cheese,
+        Self::Lettuce,
+        Self::Tomato,
+        Self::Onions,
+        Self::Bacon,
+    ];
+
+    pub const fn index(self) -> usize {
+        self as usize
+    }
+
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::Bun => "BUN",
+            Self::Patty => "PATTY",
+            Self::Cheese => "CHEESE",
+            Self::Lettuce => "LETTUCE",
+            Self::Tomato => "TOMATO",
+            Self::Onions => "ONIONS",
+            Self::Bacon => "BACON",
+        }
+    }
+
+    /// The ingredients that have to be grilled before they go on a burger.
+    pub const fn protein(self) -> Option<Protein> {
+        match self {
+            Self::Patty => Some(Protein::Patty),
+            Self::Bacon => Some(Protein::Bacon),
+            _ => None,
+        }
+    }
+}
+
+/// Something that cooks on the grill.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Protein {
+    #[default]
+    Patty,
+    Bacon,
+}
+
+impl Protein {
+    pub const ALL: [Self; 2] = [Self::Patty, Self::Bacon];
+
+    pub const fn index(self) -> usize {
+        self as usize
+    }
+
+    pub const fn ingredient(self) -> Ingredient {
+        match self {
+            Self::Patty => Ingredient::Patty,
+            Self::Bacon => Ingredient::Bacon,
+        }
+    }
+
+    /// Cook level gained per second; thin bacon cooks faster than a patty.
+    pub const fn cook_rate(self) -> f32 {
+        match self {
+            Self::Patty => COOK_RATE,
+            Self::Bacon => COOK_RATE * 1.5,
+        }
+    }
+}
 
 /// How cooked a single side of a patty is.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -44,7 +144,7 @@ impl Doneness {
     }
 }
 
-/// How good a served patty is.
+/// How well a patty or a portion of bacon was grilled.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Quality {
     /// Both sides perfect.
@@ -81,8 +181,8 @@ pub fn judge(down: f32, up: f32) -> Verdict {
     }
 }
 
-/// Points for serving a patty. `streak` is the run of perfect serves including this one;
-/// every perfect patty in a row is worth 50 more than the last, up to `MAX_STREAK`.
+/// Points for taking food off the grill. `streak` is the run of perfect ones including this
+/// one; every perfect one in a row is worth 50 more than the last, up to `MAX_STREAK`.
 pub fn serve_points(quality: Quality, streak: u32) -> i32 {
     match quality {
         Quality::Perfect => 100 + 50 * (streak.clamp(1, MAX_STREAK) as i32 - 1),
@@ -91,31 +191,140 @@ pub fn serve_points(quality: Quality, streak: u32) -> i32 {
     }
 }
 
-/// Bonus for completing an order, including a tip for the patience left (0..=1).
-pub fn order_bonus(patties: u32, patience_left: f32) -> i32 {
-    50 * patties as i32 + (patience_left.clamp(0.0, 1.0) * 100.0).round() as i32
+/// Builds a customer's order, bottom bun first. `roll` must return uniform numbers in `[0, 1)`.
+/// Orders get taller as the shift goes on.
+pub fn recipe(elapsed: f32, mut roll: impl FnMut() -> f32) -> Vec<Ingredient> {
+    use Ingredient::*;
+    let mut toppings = vec![Cheese, Lettuce, Tomato, Onions];
+    if elapsed >= BACON_FROM {
+        toppings.push(Bacon);
+    }
+    let most = (1 + (elapsed / 45.0) as usize).min(4);
+    let wanted = (1 + (roll() * most as f32) as usize).min(most);
+    let mut layers = vec![Bun, Patty];
+    if elapsed >= DOUBLE_FROM && roll() < 0.25 {
+        layers.push(Patty);
+    }
+    for _ in 0..wanted {
+        let index = ((roll() * toppings.len() as f32) as usize).min(toppings.len() - 1);
+        layers.push(toppings.swap_remove(index));
+    }
+    layers.push(Bun);
+    debug_assert!(layers.len() <= MAX_LAYERS);
+    layers
 }
 
-/// Seconds until the next customer shows up; shrinks as the shift goes on.
-pub fn order_interval(elapsed: f32) -> f32 {
-    (7.0 - elapsed * 0.03).max(3.0)
+/// Seconds until the next customer walks in; shrinks as the shift goes on.
+pub fn customer_interval(elapsed: f32) -> f32 {
+    (16.0 - elapsed * 0.03).max(8.0)
 }
 
-/// Number of patties in a new order. `roll` must be uniform in `[0, 1)`.
-pub fn order_size(elapsed: f32, roll: f32) -> u32 {
-    let multi = (elapsed / 120.0).min(0.6);
-    if roll < multi * 0.35 {
-        3
-    } else if roll < multi {
-        2
-    } else {
-        1
+/// How many seconds a customer stands in line before giving up.
+pub fn queue_patience(elapsed: f32) -> f32 {
+    (40.0 - elapsed * 0.04).max(25.0)
+}
+
+/// How many seconds a customer waits for their burger once the order is taken.
+pub fn order_patience(elapsed: f32, layers: usize) -> f32 {
+    (90.0 - elapsed * 0.08).max(55.0) + 4.0 * layers as f32
+}
+
+/// How a customer rates their burger; every part is out of 100.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Scorecard {
+    pub waiting: u32,
+    pub grilling: u32,
+    pub building: u32,
+}
+
+impl Scorecard {
+    pub fn new(
+        patience_left: f32,
+        recipe: &[Ingredient],
+        built: &[Ingredient],
+        cooked: &[Quality],
+        sloppiness: f32,
+    ) -> Self {
+        Self {
+            waiting: waiting_score(patience_left),
+            grilling: grilling_score(recipe, cooked),
+            building: building_score(recipe, built, sloppiness),
+        }
+    }
+
+    /// The customer sends back a burger that is nothing like what they ordered.
+    pub fn is_rejected(&self) -> bool {
+        self.building < REJECT_BELOW
+    }
+
+    pub fn is_perfect(&self) -> bool {
+        self.waiting >= 90 && self.grilling >= 90 && self.building >= 90
+    }
+
+    pub fn points(&self) -> i32 {
+        let bonus = if self.is_perfect() {
+            PERFECT_ORDER_BONUS
+        } else {
+            0
+        };
+        (self.waiting + self.grilling + self.building) as i32 + bonus
     }
 }
 
-/// How many seconds a customer waits for their whole order.
-pub fn order_patience(elapsed: f32, patties: u32) -> f32 {
-    (34.0 - elapsed * 0.06).max(20.0) + 7.0 * patties.saturating_sub(1) as f32
+/// Full marks while more than half of the customer's patience (0..=1) is left.
+pub fn waiting_score(patience_left: f32) -> u32 {
+    ((patience_left.clamp(0.0, 1.0) * 2.0).min(1.0) * 100.0).round() as u32
+}
+
+/// Average quality of the grilled layers. Grilled layers the order asked for
+/// but the burger lacks count as zero.
+pub fn grilling_score(recipe: &[Ingredient], cooked: &[Quality]) -> u32 {
+    let wanted = recipe
+        .iter()
+        .filter(|layer| layer.protein().is_some())
+        .count()
+        .max(cooked.len());
+    if wanted == 0 {
+        return 100;
+    }
+    let total: u32 = cooked
+        .iter()
+        .map(|quality| match quality {
+            Quality::Perfect => 100,
+            Quality::Good => 70,
+            Quality::Dry => 40,
+        })
+        .sum();
+    total / wanted as u32
+}
+
+/// How closely the stack matches the order, layer by layer and in the right sequence,
+/// marked down by up to 30% for a `sloppiness` (0..=1) of layers dropped off-centre.
+pub fn building_score(recipe: &[Ingredient], built: &[Ingredient], sloppiness: f32) -> u32 {
+    let longest = recipe.len().max(built.len());
+    if longest == 0 {
+        return 0;
+    }
+    let accuracy = common_layers(recipe, built) as f32 / longest as f32;
+    (accuracy * (1.0 - 0.3 * sloppiness.clamp(0.0, 1.0)) * 100.0).round() as u32
+}
+
+/// Length of the longest sequence of layers that appears in both stacks in the same order.
+fn common_layers(a: &[Ingredient], b: &[Ingredient]) -> usize {
+    let mut row = vec![0; b.len() + 1];
+    for x in a {
+        let mut diagonal = 0;
+        for (j, y) in b.iter().enumerate() {
+            let above = row[j + 1];
+            row[j + 1] = if x == y {
+                diagonal + 1
+            } else {
+                above.max(row[j])
+            };
+            diagonal = above;
+        }
+    }
+    row[b.len()]
 }
 
 #[cfg(test)]
@@ -158,29 +367,111 @@ mod tests {
     }
 
     #[test]
-    fn order_bonus_rewards_speed() {
-        assert_eq!(order_bonus(1, 0.0), 50);
-        assert_eq!(order_bonus(2, 1.0), 200);
-        assert_eq!(order_bonus(1, 7.0), order_bonus(1, 1.0));
+    fn recipes_are_buns_around_a_patty() {
+        use Ingredient::*;
+        let mut seed = 0.37_f32;
+        let mut roll = move || {
+            seed = (seed * 7.13 + 0.31).fract();
+            seed
+        };
+        for elapsed in [0.0, 30.0, 60.0, 120.0, 600.0] {
+            for _ in 0..50 {
+                let layers = recipe(elapsed, &mut roll);
+                assert_eq!(layers.first(), Some(&Bun));
+                assert_eq!(layers.last(), Some(&Bun));
+                assert_eq!(layers[1], Patty);
+                assert!((4..=MAX_LAYERS).contains(&layers.len()));
+                for topping in [Cheese, Lettuce, Tomato, Onions, Bacon] {
+                    assert!(layers.iter().filter(|&&layer| layer == topping).count() <= 1);
+                }
+                if elapsed < BACON_FROM {
+                    assert!(!layers.contains(&Bacon));
+                    assert_eq!(layers.len(), 4);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn waiting_is_forgiving_at_first() {
+        assert_eq!(waiting_score(1.0), 100);
+        assert_eq!(waiting_score(0.5), 100);
+        assert_eq!(waiting_score(0.25), 50);
+        assert_eq!(waiting_score(-1.0), 0);
+    }
+
+    #[test]
+    fn grilling_averages_the_cooked_layers() {
+        use Ingredient::*;
+        let order = [Bun, Patty, Bacon, Bun];
+        assert_eq!(grilling_score(&[Bun, Lettuce, Bun], &[]), 100);
+        assert_eq!(
+            grilling_score(&order, &[Quality::Perfect, Quality::Perfect]),
+            100
+        );
+        assert_eq!(
+            grilling_score(&order, &[Quality::Perfect, Quality::Dry]),
+            70
+        );
+        // The bacon is missing.
+        assert_eq!(grilling_score(&order, &[Quality::Perfect]), 50);
+        assert_eq!(grilling_score(&order, &[]), 0);
+    }
+
+    #[test]
+    fn building_rewards_the_right_layers_in_the_right_order() {
+        use Ingredient::*;
+        let order = [Bun, Patty, Cheese, Lettuce, Bun];
+        assert_eq!(building_score(&order, &order, 0.0), 100);
+        assert_eq!(building_score(&order, &order, 1.0), 70);
+        // One layer missing, one swapped, one extra.
+        assert_eq!(building_score(&order, &[Bun, Patty, Lettuce, Bun], 0.0), 80);
+        assert_eq!(
+            building_score(&order, &[Bun, Patty, Lettuce, Cheese, Bun], 0.0),
+            80
+        );
+        assert_eq!(
+            building_score(&order, &[Bun, Patty, Cheese, Lettuce, Tomato, Bun], 0.0),
+            83
+        );
+        assert_eq!(building_score(&order, &[], 0.0), 0);
+        assert!(building_score(&order, &[Bun, Bun], 0.0) >= REJECT_BELOW);
+        assert!(building_score(&order, &[Tomato, Onions], 0.0) < REJECT_BELOW);
+    }
+
+    #[test]
+    fn scorecards_pay_out() {
+        use Ingredient::*;
+        let order = [Bun, Patty, Cheese, Bun];
+        let perfect = Scorecard::new(0.9, &order, &order, &[Quality::Perfect], 0.0);
+        assert!(perfect.is_perfect() && !perfect.is_rejected());
+        assert_eq!(perfect.points(), 300 + PERFECT_ORDER_BONUS);
+        let late = Scorecard::new(0.1, &order, &order, &[Quality::Good], 0.5);
+        assert_eq!((late.waiting, late.grilling, late.building), (20, 70, 85));
+        assert_eq!(late.points(), 175);
+        let wrong = Scorecard::new(0.9, &order, &[Lettuce], &[], 0.0);
+        assert!(wrong.is_rejected());
+    }
+
+    #[test]
+    fn bacon_cooks_faster_than_patties() {
+        assert!(Protein::Bacon.cook_rate() > Protein::Patty.cook_rate());
+        for protein in Protein::ALL {
+            assert_eq!(protein.ingredient().protein(), Some(protein));
+        }
+        for (index, ingredient) in Ingredient::ALL.into_iter().enumerate() {
+            assert_eq!(ingredient.index(), index);
+        }
     }
 
     #[test]
     fn difficulty_ramps_up_and_levels_off() {
-        assert!(order_interval(0.0) > order_interval(60.0));
-        assert_eq!(order_interval(10_000.0), 3.0);
-        assert!(order_patience(0.0, 1) > order_patience(120.0, 1));
-        assert_eq!(order_patience(10_000.0, 1), 20.0);
-        assert!(order_patience(0.0, 3) > order_patience(0.0, 1));
-    }
-
-    #[test]
-    fn early_orders_are_single_patties() {
-        for i in 0..100 {
-            assert_eq!(order_size(0.0, i as f32 / 100.0), 1);
-        }
-        let late: Vec<u32> = (0..100)
-            .map(|i| order_size(600.0, i as f32 / 100.0))
-            .collect();
-        assert!(late.contains(&1) && late.contains(&2) && late.contains(&3));
+        assert!(customer_interval(0.0) > customer_interval(60.0));
+        assert_eq!(customer_interval(10_000.0), 8.0);
+        assert!(queue_patience(0.0) > queue_patience(120.0));
+        assert_eq!(queue_patience(10_000.0), 25.0);
+        assert!(order_patience(0.0, 4) > order_patience(120.0, 4));
+        assert_eq!(order_patience(10_000.0, 4), 71.0);
+        assert!(order_patience(0.0, 8) > order_patience(0.0, 4));
     }
 }
